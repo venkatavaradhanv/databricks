@@ -801,7 +801,119 @@ else
 fi
 ```
 
-After fixing, reload Kiro to clear the validation error before continuing to Step 3.
+After fixing, reload Kiro to clear the validation error before continuing to Step 2.6.
+
+### Step 2.6: Remove the Standalone `databricks` Entry the Installer Wrote
+
+> **⚠️ Agent behavior (REQUIRED):** Step 1's installer (`install.sh`) writes a top-level `mcpServers.databricks` entry to `~/.kiro/settings/mcp.json`. That entry was designed for users running ai-dev-kit *without* a Kiro Power — for our flow it is a duplicate registration of the same MCP server the Power owns. Leaving both entries in place causes Kiro to launch two copies of the server (same binary, two different env blocks), which can confuse tool routing.
+>
+> The agent MUST delete the top-level `mcpServers.databricks` entry after the installer runs, leaving only the Power's entry under `powers.mcpServers.power-databricks-databricks`.
+
+**Idempotent fix command:**
+
+```bash
+MCP_CFG="$HOME/.kiro/settings/mcp.json"
+
+if command -v jq >/dev/null 2>&1; then
+  if jq -e '.mcpServers.databricks' "$MCP_CFG" >/dev/null 2>&1; then
+    tmp=$(mktemp)
+    jq 'del(.mcpServers.databricks)' "$MCP_CFG" > "$tmp" && mv "$tmp" "$MCP_CFG"
+    echo "Removed standalone mcpServers.databricks entry."
+  else
+    echo "No standalone entry to remove — already clean."
+  fi
+else
+  echo "jq not installed. Open $MCP_CFG and delete the 'mcpServers.databricks' object manually, leaving 'mcpServers' as {} or with other entries you intentionally configured."
+fi
+```
+
+**Before:**
+```json
+{
+  "mcpServers": {
+    "databricks": {
+      "command": "/Users/<you>/.ai-dev-kit/.venv/bin/python",
+      "args": ["/Users/<you>/.ai-dev-kit/repo/databricks-mcp-server/run_server.py"],
+      "defer_loading": true,
+      "env": { "DATABRICKS_CONFIG_PROFILE": "DEFAULT" }
+    }
+  },
+  "powers": {
+    "mcpServers": {
+      "power-databricks-databricks": { ... }
+    }
+  }
+}
+```
+
+**After:**
+```json
+{
+  "mcpServers": {},
+  "powers": {
+    "mcpServers": {
+      "power-databricks-databricks": { ... }
+    }
+  }
+}
+```
+
+Reload Kiro to drop the now-removed standalone server connection. The Power's entry under `powers.mcpServers` is the one that runs from here on.
+
+> **If you have OTHER MCP servers** (not `databricks`) under top-level `mcpServers` that you intentionally configured for non-Power use, the `jq` snippet above leaves them alone — it only removes the `databricks` key.
+
+### Step 2.7: Expand `~` in the Power's `command` and `args` Paths
+
+> **⚠️ Agent behavior (REQUIRED):** The Power's bundled `mcp.json` ships with `~/.ai-dev-kit/...` paths (tilde for the user's home directory). Kiro copies these paths verbatim into `~/.kiro/settings/mcp.json` under `powers.mcpServers.power-databricks-databricks`. **Node's `child_process.spawn()` does not expand `~`** — it looks for a literal directory named `~`, which doesn't exist, and the MCP server fails to launch with:
+>
+> ```
+> Error connecting to MCP server: spawn ~/.ai-dev-kit/.venv/bin/python ENOENT
+> ```
+>
+> The agent MUST replace `~` with the absolute home path in both `command` and every entry in `args` before the server can launch.
+
+**Idempotent fix command:**
+
+```bash
+MCP_CFG="$HOME/.kiro/settings/mcp.json"
+HOME_PATH="$HOME"
+
+if command -v jq >/dev/null 2>&1; then
+  tmp=$(mktemp)
+  jq --arg h "$HOME_PATH" '
+    if .powers.mcpServers["power-databricks-databricks"] then
+      .powers.mcpServers["power-databricks-databricks"].command |= ($h + (.|ltrimstr("~"))) |
+      .powers.mcpServers["power-databricks-databricks"].args    |= map($h + (.|ltrimstr("~")))
+    else . end
+  ' "$MCP_CFG" > "$tmp" && mv "$tmp" "$MCP_CFG"
+  echo "Expanded ~ to $HOME_PATH in command and args."
+else
+  echo "jq not installed. Open $MCP_CFG and replace ~/.ai-dev-kit/... with $HOME/.ai-dev-kit/... in both 'command' and every entry of 'args'."
+fi
+```
+
+**Before:**
+```json
+"command": "~/.ai-dev-kit/.venv/bin/python",
+"args": ["~/.ai-dev-kit/repo/databricks-mcp-server/run_server.py"]
+```
+
+**After** (assuming `$HOME = /Users/visvenky`):
+```json
+"command": "/Users/visvenky/.ai-dev-kit/.venv/bin/python",
+"args": ["/Users/visvenky/.ai-dev-kit/repo/databricks-mcp-server/run_server.py"]
+```
+
+The transformation is per-user (your `$HOME` ends up baked in), so this fix has to run on each developer's machine — it can't be pre-applied in the bundled file.
+
+Verify the binaries exist at the expanded paths:
+
+```bash
+ls -la "$HOME/.ai-dev-kit/.venv/bin/python"
+ls -la "$HOME/.ai-dev-kit/repo/databricks-mcp-server/run_server.py"
+```
+
+If either is missing, Step 1's installer didn't complete — re-run it. Otherwise, reload Kiro; the `ENOENT` error should clear.
 
 ### Step 3: Configure Authentication
 
@@ -834,6 +946,7 @@ The Power ships with a baseline `mcp.json` that uses an env-var reference for th
 >    - One choice to skip — the user will edit `mcp.json` themselves
 > 4. **Never copy credentials between configurations without explicit user approval.** Silent reuse is not acceptable, even when the credentials appear identical or compatible.
 > 5. **Present the choices neutrally.** Do not label any option as "recommended", "quickest", or "easiest" — credential reuse is the user's decision on its merits, not the agent's recommendation.
+> 6. **Always present all four options in A → B → C → D order**, even when no credentials are detected for a given option. Do **not** skip an option because detection found nothing for it — instead, show it with the "no credentials found, here's how to set up" path. Skipping options (e.g., showing only B/C/D, or A/C/D) makes the list look broken and confuses the user. The list must always read A, B, C, D — never B, C, D or A, B, D.
 >
 > Example of an acceptable summary the agent shows the user:
 > ```
